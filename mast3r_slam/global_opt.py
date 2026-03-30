@@ -4,6 +4,7 @@ from mast3r_slam.config import config
 from mast3r_slam.frame import SharedKeyframes
 from mast3r_slam.geometry import (
     constrain_points_to_ray,
+    skew_sym,  # needed for solve_GN_points Jacobian
 )
 from mast3r_slam.mast3r_utils import mast3r_match_symmetric
 import mast3r_slam_backends
@@ -113,12 +114,20 @@ class FactorGraph:
         kfs = [self.frames[idx] for idx in unique_kf_idx]
         Xs = torch.stack([kf.X_canon for kf in kfs])
         T_WCs = lietorch.Sim3(torch.stack([kf.T_WC.data for kf in kfs]))
-
         Cs = torch.stack([kf.get_average_conf() for kf in kfs])
-
         return Xs, T_WCs, Cs
 
+    # Modification : dispatch function to choose solver based on config
+    # Called from solve_GN_rays so existing caller-side code is unchanged
     def solve_GN_rays(self):
+        """Dispatches to solve_GN_points when error_formulation == 'point', otherwise uses the original CUDA ray solver"""
+        error_formulation = self.cfg.get("error_formulation", "ray")
+        if error_formulation == "point":
+            return self.solve_GN_points()
+        return self._solve_GN_rays_cuda()
+
+    # original solve_GN_rays function
+    def _solve_GN_rays_cuda(self):
         pin = self.cfg["pin"]
         unique_kf_idx = self.get_unique_kf_idx()
         n_unique_kf = unique_kf_idx.numel()
@@ -126,7 +135,6 @@ class FactorGraph:
             return
 
         Xs, T_WCs, Cs = self.get_poses_points(unique_kf_idx)
-
         ii, jj, idx_ii2jj, valid_match, Q_ii2jj = self.prep_two_way_edges()
 
         C_thresh = self.cfg["C_conf"]
@@ -157,6 +165,140 @@ class FactorGraph:
         # Update the keyframe T_WC
         self.frames.update_T_WCs(T_WCs[pin:], unique_kf_idx[pin:])
 
+    # pure PyTorch Gauss-Newton with 3D point error
+    def solve_GN_points(self):
+        """Python Gauss-Newton solver using 3D point error instead of ray+distance"""
+        pin = self.cfg["pin"]
+        unique_kf_idx = self.get_unique_kf_idx()
+        n_unique_kf = unique_kf_idx.numel()
+        if n_unique_kf <= pin:
+            return
+
+        Xs, T_WCs, Cs = self.get_poses_points(unique_kf_idx)
+        ii, jj, idx_ii2jj, valid_match, Q_ii2jj = self.prep_two_way_edges()
+
+        sigma_point  = self.cfg.get("sigma_point", 0.05)
+        C_thresh     = self.cfg["C_conf"]
+        Q_thresh     = self.cfg["Q_conf"]
+        max_iter     = self.cfg["max_iters"]
+        delta_thresh = self.cfg["delta_norm"]
+        subsample    = int(self.cfg.get("point_subsample", 4))
+
+        device = self.device
+        dtype  = Xs.dtype
+        n      = n_unique_kf
+
+        # Map global keyframe index to local index
+        kf_to_local = {int(k): v for v, k in enumerate(unique_kf_idx.tolist())}
+
+        for _ in range(max_iter):
+            H = torch.zeros(7 * n, 7 * n, device=device, dtype=dtype)
+            g = torch.zeros(7 * n, 1, device=device, dtype=dtype)
+
+            n_edges = ii.shape[0]
+            for e in range(n_edges):
+                i_global = int(ii[e])
+                j_global = int(jj[e])
+                i_local  = kf_to_local[i_global]
+                j_local  = kf_to_local[j_global]
+
+                # Per-edge data
+                idx_i2j_e = idx_ii2jj[e].view(-1)
+                valid_e   = valid_match[e].view(-1, 1)
+                Q_e       = Q_ii2jj[e].view(-1, 1)
+
+                Xi = Xs[i_local]
+                Xj = Xs[j_local]
+                Ci = Cs[i_local]
+                Cj = Cs[j_local]
+
+                # Get Sim3 poses
+                T_WCi = lietorch.Sim3(T_WCs.data[i_local : i_local + 1])
+                T_WCj = lietorch.Sim3(T_WCs.data[j_local : j_local + 1])
+
+                # Combined validity mask
+                valid_C = (Ci > C_thresh) & (Cj[idx_i2j_e] > C_thresh)
+                valid_all = valid_e & valid_C & (Q_e > Q_thresh)
+                mask = valid_all.squeeze(1)
+
+                if mask.sum() == 0:
+                    continue
+
+                # Optional subsampling to speed up backend
+                if subsample > 1:
+                    idxs = torch.where(mask)[0][::subsample]
+                    mask_sub = torch.zeros_like(mask)
+                    mask_sub[idxs] = True
+                    mask = mask_sub
+
+                Xi_valid  = Xi[mask]
+                Xj_valid  = Xj[idx_i2j_e[mask]]
+                Q_valid   = Q_e[mask]
+
+                # Relative transform in camera i frame
+                T_ij     = T_WCi.inv() * T_WCj
+                T_ij     = lietorch.Sim3(T_ij.data.squeeze(0))
+                Xj_in_i  = T_ij.act(Xj_valid)
+
+                # Residual
+                r = Xi_valid - Xj_in_i
+
+                # Jacobian via world-frame positions
+                # y_j: world-frame positions of matched j-points
+                T_WCj_sq = lietorch.Sim3(T_WCj.data.squeeze(0))
+                yj = T_WCj_sq.act(Xj_valid)
+
+                J_base = self._compute_J_base(yj)
+
+                # Apply linear part of T_WCi.inv() to each column
+                J_world = self._apply_T_inv_lin(T_WCi, J_base)
+
+                # Information weight
+                sqrt_info = (1.0 / sigma_point) * torch.sqrt(Q_valid).repeat(1, 3)
+
+                # Whitened residual & Jacobians
+                wr  = (sqrt_info * r).reshape(-1, 1)
+                wJi = (sqrt_info[..., None] * J_world).reshape(-1, 7)
+                wJj = (-sqrt_info[..., None] * J_world).reshape(-1, 7)
+
+                # Accumulate normal equations
+                si = slice(7 * i_local, 7 * (i_local + 1))
+                sj = slice(7 * j_local, 7 * (j_local + 1))
+
+                H[si, si] += wJi.T @ wJi
+                H[sj, sj] += wJj.T @ wJj
+                H[si, sj] += wJi.T @ wJj
+                H[sj, si] += wJj.T @ wJi
+
+                g[si] += -(wJi.T @ wr)
+                g[sj] += -(wJj.T @ wr)
+
+            # Solve for free poses
+            free_start = 7 * pin
+            H_free = H[free_start:, free_start:]
+            g_free = g[free_start:]
+
+            # Tikhonov regularisation for stability
+            H_free = H_free + 1e-6 * torch.eye(H_free.shape[0], device=device, dtype=dtype)
+
+            try:
+                L = torch.linalg.cholesky(H_free, upper=False)
+                delta_free = torch.cholesky_solve(g_free, L, upper=False).view(-1)
+            except RuntimeError:
+                break
+
+            # Apply incremental updates to free poses
+            for k, local_idx in enumerate(range(pin, n)):
+                delta_k = delta_free[7 * k : 7 * (k + 1)].unsqueeze(0)
+                T_WCs.data[local_idx] = T_WCs[local_idx].retr(delta_k).data[0]
+
+            if delta_free.norm().item() < delta_thresh:
+                break
+
+        # Write back updated poses
+        self.frames.update_T_WCs(T_WCs[pin:], unique_kf_idx[pin:])
+
+
     def solve_GN_calib(self):
         K = self.K
         pin = self.cfg["pin"]
@@ -184,7 +326,6 @@ class FactorGraph:
 
         pose_data = T_WCs.data[:, 0, :]
 
-        img_size = self.frames[0].img.shape[-2:]
         height, width = img_size
 
         mast3r_slam_backends.gauss_newton_calib(
@@ -211,3 +352,38 @@ class FactorGraph:
 
         # Update the keyframe T_WC
         self.frames.update_T_WCs(T_WCs[pin:], unique_kf_idx[pin:])
+
+
+    # Helpers for solve_GN_points
+    @staticmethod
+    def _compute_J_base(y: torch.Tensor):
+        """Build the base Jacobian for a batch of world-frame points y"""
+        N = y.shape[0]
+        device, dtype = y.device, y.dtype
+
+        I = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).expand(N, -1, -1)
+        neg_skew = -skew_sym(y)
+        y_col = y.unsqueeze(-1)
+
+        return torch.cat([I, neg_skew, y_col], dim=-1)
+
+    @staticmethod
+    def _apply_T_inv_lin(T_WCi: lietorch.Sim3, J_base: torch.Tensor):
+        """Apply the *linear* (rotation+scale, no translation) part of T_WCi.inv() to every column of J_base"""
+        N = J_base.shape[0]
+        device, dtype = J_base.device, J_base.dtype
+
+        T_WCi_inv = lietorch.Sim3(T_WCi.data.squeeze(0)).inv()
+
+        # Translation of T_WCi^{-1}  (subtracted to isolate the linear part)
+        zero = torch.zeros(1, 3, device=device, dtype=dtype)
+        t_inv = T_WCi_inv.act(zero)
+
+        cols = J_base.permute(0, 2, 1).reshape(-1, 3)
+
+        # Apply T_WCi^{-1} and subtract translation : linear part only
+        transformed = T_WCi_inv.act(cols) - t_inv
+
+        J_world = transformed.reshape(N, 7, 3).permute(0, 2, 1)
+
+        return J_world

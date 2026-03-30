@@ -29,6 +29,7 @@ class Frame:
     N: int = 0
     N_updates: int = 0
     K: Optional[torch.Tensor] = None
+    score: float = -float("inf")
 
     def get_score(self, C):
         filtering_score = config["tracking"]["filtering_score"]

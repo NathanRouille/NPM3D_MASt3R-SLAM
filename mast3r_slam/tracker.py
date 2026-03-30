@@ -20,7 +20,7 @@ class FrameTracker:
         self.device = device
 
         self.reset_idx_f2k()
-
+    
     # Initialize with identity indexing of size (1,n)
     def reset_idx_f2k(self):
         self.idx_f2k = None
@@ -69,12 +69,21 @@ class FrameTracker:
             print(f"Skipped frame {frame.frame_id}")
             return False, [], True
 
+
+        # Dispatch: ray error (paper default) vs point error
+        error_formulation = self.cfg.get("error_formulation", "ray")
+
         try:
             # Track
             if not use_calib:
-                T_WCf, T_CkCf = self.opt_pose_ray_dist_sim3(
-                    Xf, Xk, T_WCf, T_WCk, Qk, valid_opt
-                )
+                if error_formulation == "point":
+                    T_WCf, T_CkCf = self.opt_pose_point_sim3(
+                        Xf, Xk, T_WCf, T_WCk, Qk, valid_opt
+                    )
+                else:  #ray
+                    T_WCf, T_CkCf = self.opt_pose_ray_dist_sim3(
+                        Xf, Xk, T_WCf, T_WCk, Qk, valid_opt
+                    )
             else:
                 T_WCf, T_CkCf = self.opt_pose_calib_sim3(
                     Xf,
@@ -91,10 +100,10 @@ class FrameTracker:
         except Exception as e:
             print(f"Cholesky failed {frame.frame_id}")
             return False, [], True
-
+        
+        # Use pose to transform points to update keyframe
         frame.T_WC = T_WCf
 
-        # Use pose to transform points to update keyframe
         Xkk = T_CkCf.act(Xkf)
         keyframe.update_pointmap(Xkk, Ckf)
         # write back the fitered pointmap
@@ -147,7 +156,7 @@ class FrameTracker:
             uv_k = get_pixel_coords(1, img_size, device=Xf.device, dtype=Xf.dtype)
             uv_k = uv_k.view(-1, 2)
             meas_k = torch.cat((uv_k, torch.log(Xk[..., 2:3])), dim=-1)
-            # Avoid any bad calcs in log
+            # Avoid any bad calcs in log            
             valid_meas_k = Xk[..., 2:3] > self.cfg["depth_eps"]
             meas_k[~valid_meas_k.repeat(1, 3)] = 0.0
 
@@ -170,6 +179,7 @@ class FrameTracker:
 
         return tau_j, cost
 
+    # paper: Ray + distance error (uncalibrated)
     def opt_pose_ray_dist_sim3(self, Xf, Xk, T_WCf, T_WCk, Qk, valid):
         last_error = 0
         sqrt_info_ray = 1 / self.cfg["sigma_ray"] * valid * torch.sqrt(Qk)
@@ -178,7 +188,7 @@ class FrameTracker:
 
         # Solving for relative pose without scale!
         T_CkCf = T_WCk.inv() * T_WCf
-
+        
         # Precalculate distance and ray for obs k
         rd_k = point_to_ray_dist(Xk, jacobian=False)
 
@@ -207,15 +217,50 @@ class FrameTracker:
 
             if step == self.cfg["max_iters"] - 1:
                 print(f"max iters reached {last_error}")
-
+    
         # Assign new pose based on relative pose
         T_WCf = T_WCk * T_CkCf
 
         return T_WCf, T_CkCf
 
-    def opt_pose_calib_sim3(
-        self, Xf, Xk, T_WCf, T_WCk, Qk, valid, meas_k, valid_meas_k, K, img_size
-    ):
+    # Direct 3D point error (ablation, no calibration)
+    def opt_pose_point_sim3(self, Xf, Xk, T_WCf, T_WCk, Qk, valid):
+        """replace the ray+dist residual with a plain 3D Euclidean point error"""
+
+        sqrt_info_point = 1.0 / self.cfg["sigma_point"] * valid * torch.sqrt(Qk)
+        sqrt_info = sqrt_info_point.repeat(1, 3)
+
+        T_CkCf = T_WCk.inv() * T_WCf
+
+        old_cost = float("inf")
+        for step in range(self.cfg["max_iters"]):
+            # Transform frame points into keyframe camera frame
+            Xf_Ck, dXf_Ck_dT_CkCf = act_Sim3(T_CkCf, Xf, jacobian=True)
+            r = Xk - Xf_Ck
+            # negative Jacobian of the transformed point w.r.t. the pose
+            J = -dXf_Ck_dT_CkCf
+
+            tau_ij_sim3, new_cost = self.solve(sqrt_info, r, J)
+            T_CkCf = T_CkCf.retr(tau_ij_sim3)
+
+            if check_convergence(
+                step,
+                self.cfg["rel_error"],
+                self.cfg["delta_norm"],
+                old_cost,
+                new_cost,
+                tau_ij_sim3,
+            ):
+                break
+            old_cost = new_cost
+
+            if step == self.cfg["max_iters"] - 1:
+                print(f"[point error] max iters reached")
+
+        T_WCf = T_WCk * T_CkCf
+        return T_WCf, T_CkCf
+
+    def opt_pose_calib_sim3(self, Xf, Xk, T_WCf, T_WCk, Qk, valid, meas_k, valid_meas_k, K, img_size):
         last_error = 0
         sqrt_info_pixel = 1 / self.cfg["sigma_pixel"] * valid * torch.sqrt(Qk)
         sqrt_info_depth = 1 / self.cfg["sigma_depth"] * valid * torch.sqrt(Qk)
@@ -237,7 +282,7 @@ class FrameTracker:
             )
             valid2 = valid_proj & valid_meas_k
             sqrt_info2 = valid2 * sqrt_info
-
+            
             # r = z-h(x)
             r = meas_k - pzf_Ck
             # Jacobian

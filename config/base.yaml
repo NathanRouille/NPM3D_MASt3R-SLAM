@@ -6,6 +6,9 @@ dataset:
   center_principle_point: True
 
 matching:
+  method: iterative_proj    # iterative_proj (paper) | kdtree | bruteforce
+  bruteforce_chunk: 256    # chunk size for brute-force GPU computation
+  bruteforce_subsample: 8
   max_iter: 10
   lambda_init: 1e-8
   convergence_thresh: 1e-6
@@ -29,12 +32,13 @@ tracking:
   sigma_point: 0.05
   pixel_border: -10 # Only in calib (negative means allow pixels outside image up to that distance)
   depth_eps: 1e-6 # Only in calib case
-  filtering_mode: weighted_pointmap # recent, first, best_score, weighted_pointmap, weighted_spherical, indep_conf
-  filtering_score: median # median, mean (only used for filtering_mode=best_score)
+  filtering_mode: weighted_pointmap   # recent, first, best_score, weighted_pointmap, weighted_spherical, indep_conf
+  filtering_score: median # median, mean (only for filtering_mode=best_score)
+  error_formulation: ray # ray (paper default) | point
 
 local_opt:
   pin: 1
-  window_size: 1e+6   
+  window_size: 1e+6
   C_conf: 0.0
   Q_conf: 1.5
   min_match_frac: 0.1
@@ -48,6 +52,8 @@ local_opt:
   sigma_point: 0.05
   delta_norm: 1e-8
   use_cuda: True
+  error_formulation: ray # ray (paper default) | point
+  point_subsample: 4 # subsample factor for solve_GN_points
 
 retrieval:
   k: 3

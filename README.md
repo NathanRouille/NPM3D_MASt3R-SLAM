@@ -1,3 +1,54 @@
+## Ablation Experiments
+
+This repository extends the original MASt3R-SLAM with four ablation experiments.
+Before running any experiment, make sure you have followed the full installation
+procedure described below, as all required dependencies are included in the project build.
+
+### Pointmap Fusion Ablation
+Compares four pointmap fusion strategies: `recent`, `first`, `median`, `weighted_pointmap`.
+```
+python experiments/run_fusion_ablation.py \
+    --dataset_root datasets/tum \
+    --save_root    results/fusion_ablation
+```
+
+### Ray Error vs. Point Error
+Compares the paper's ray error formulation against a direct 3D point error.
+```
+python experiments/run_error_ablation.py \
+    --dataset_root datasets/tum \
+    --save_root    results/error_ablation
+```
+
+### Loop Closure Ablation
+Evaluates the impact of loop closure on short vs. long sequences.
+```
+python experiments/run_loopclosure_ablation.py \
+    --scenes_root  datasets/7-scenes \
+    --tum_root     datasets/tum \
+    --save_root    results/lc_ablation \
+    --scenes heads redkitchen \
+    --tum_sequences rgbd_dataset_freiburg1_desk rgbd_dataset_freiburg1_room
+```
+
+### Matching Method Comparison
+Compares iterative projective matching against k-d tree and brute-force alternatives.
+```
+python experiments/run_matching_ablation.py \
+    --tum_root  datasets/tum \
+    --save_root results/matching_ablation
+```
+> **Note:** Brute-force matching is memory-intensive. On GPUs with less than 24 GB VRAM,
+> set `matching.bruteforce_subsample: 8` and `matching.bruteforce_chunk: 256` in `config/base.yaml`.
+
+### Modified source files
+The following files from the original repository were modified:
+- `mast3r_slam/frame.py` : bug fix (added `score` field default to `Frame` dataclass)
+- `mast3r_slam/tracker.py` : added point error formulation (`opt_pose_point_sim3`)
+- `mast3r_slam/global_opt.py` : added Python Gauss-Newton backend for point error (`solve_GN_points`)
+- `mast3r_slam/matching.py` : added k-d tree and brute-force matching methods
+- `config/base.yaml` : added `error_formulation`, `method`, and related hyperparameters
+
 [comment]: <> (# MASt3R-SLAM: Real-Time Dense SLAM with 3D Reconstruction Priors)
 
 <p align="center">

@@ -10,6 +10,7 @@ dependencies = [
     "einops",
     "pyrealsense2",
     "evo",
+    "scipy",
     "natsort",
     # "torchcodec==0.1",
     "lietorch @ git+https://github.com/princeton-vl/lietorch.git",

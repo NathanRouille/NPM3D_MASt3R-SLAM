@@ -4,6 +4,8 @@ This repository extends the original MASt3R-SLAM with four ablation experiments.
 Before running any experiment, make sure you have followed the full installation
 procedure described below, as all required dependencies are included in the project build.
 
+For a comprehensive analysis of the methodology, theoretical background, and detailed ablation studies, please refer to the complete [project report](report.pdf).
+
 ### Pointmap Fusion Ablation
 Compares four pointmap fusion strategies: `recent`, `first`, `median`, `weighted_pointmap`.
 ```
